@@ -220,6 +220,20 @@ function csvEscape(value: unknown): string {
   return `"${text}"`;
 }
 
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error) {
+    return error.name && error.name !== "Error"
+      ? `${error.name}: ${error.message}`
+      : error.message;
+  }
+
+  if (typeof error === "string") {
+    return error;
+  }
+
+  return fallback;
+}
+
 async function parseApiResponse(response: Response): Promise<unknown> {
   const text = await response.text();
 
@@ -385,10 +399,18 @@ async function searchProperty(request: SearchRequest): Promise<CombinedSearchRes
     params.set("huisnummertoevoeging", request.huisnummertoevoeging.trim());
   }
 
-  const response = await fetch(`/api/property/search?${params.toString()}`, {
+  const requestUrl = `/api/property/search?${params.toString()}`;
+  const response = await fetch(requestUrl, {
     headers: {
       Accept: "application/json"
     }
+  }).catch((error: unknown) => {
+    throw new Error(
+      `Network request failed for ${request.postcode} ${request.huisnummer}: ${getErrorMessage(
+        error,
+        "Unknown network error."
+      )}`
+    );
   });
   const body = (await parseApiResponse(response)) as
     | CombinedSearchResponse
@@ -950,9 +972,14 @@ function App() {
 
       setBatchRows(parsedRows);
       setActiveTab("batch");
-    } catch {
+    } catch (readError) {
       setBatchRows([]);
-      setBatchError("The Excel file could not be read.");
+      setBatchError(
+        `The Excel file could not be read: ${getErrorMessage(
+          readError,
+          "Unknown Excel parsing error."
+        )}`
+      );
     }
   }
 
@@ -972,52 +999,58 @@ function App() {
     setBatchResults([]);
     setBatchProgress(0);
 
-    for (const row of batchRows) {
-      const validationError = validateBatchRow(row);
-      if (validationError) {
-        setBatchResults((current) => [
-          ...current,
-          {
-            row,
-            status: "error",
-            error: validationError
-          }
-        ]);
-        setBatchProgress((current) => current + 1);
-        continue;
-      }
+    try {
+      for (const row of batchRows) {
+        const validationError = validateBatchRow(row);
+        if (validationError) {
+          setBatchResults((current) => [
+            ...current,
+            {
+              row,
+              status: "error",
+              error: validationError
+            }
+          ]);
+          setBatchProgress((current) => current + 1);
+          continue;
+        }
 
-      try {
-        const result = await searchProperty({
-          postcode: row.postcode,
-          huisnummer: row.huisnummer,
-          huisletter: row.huisletter,
-          huisnummertoevoeging: row.huisnummertoevoeging,
-          route: form.route
-        });
-        setBatchResults((current) => [
-          ...current,
-          { row, status: "success", data: result }
-        ]);
-      } catch (searchError) {
-        setBatchResults((current) => [
-          ...current,
-          {
-            row,
-            status: "error",
-            error:
-              searchError instanceof Error
-                ? searchError.message
-                : "Search failed for this row."
-          }
-        ]);
-      } finally {
-        setBatchProgress((current) => current + 1);
+        try {
+          const result = await searchProperty({
+            postcode: row.postcode,
+            huisnummer: row.huisnummer,
+            huisletter: row.huisletter,
+            huisnummertoevoeging: row.huisnummertoevoeging,
+            route: form.route
+          });
+          setBatchResults((current) => [
+            ...current,
+            { row, status: "success", data: result }
+          ]);
+        } catch (searchError) {
+          setBatchResults((current) => [
+            ...current,
+            {
+              row,
+              status: "error",
+              error: getErrorMessage(searchError, "Search failed for this row.")
+            }
+          ]);
+        } finally {
+          setBatchProgress((current) => current + 1);
+        }
       }
+    } catch (batchError) {
+      setBatchError(
+        `Batch processing stopped unexpectedly: ${getErrorMessage(
+          batchError,
+          "Unknown batch error."
+        )}`
+      );
+    } finally {
+      setBatchLoading(false);
+      setActiveTab("batch");
     }
-
-    setBatchLoading(false);
-    setActiveTab("batch");
   }
 
   function exportJson() {
