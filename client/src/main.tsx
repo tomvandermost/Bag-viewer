@@ -220,6 +220,25 @@ function csvEscape(value: unknown): string {
   return `"${text}"`;
 }
 
+async function parseApiResponse(response: Response): Promise<unknown> {
+  const text = await response.text();
+
+  if (!text) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    const preview = text.slice(0, 220).replace(/\s+/g, " ").trim();
+    throw new Error(
+      response.ok
+        ? "The API returned a response that could not be read as JSON."
+        : `The API returned HTTP ${response.status} instead of JSON.${preview ? ` Response: ${preview}` : ""}`
+    );
+  }
+}
+
 function downloadFile(filename: string, content: string, type: string) {
   const blob = new Blob([content], { type });
   const url = URL.createObjectURL(blob);
@@ -366,12 +385,26 @@ async function searchProperty(request: SearchRequest): Promise<CombinedSearchRes
     params.set("huisnummertoevoeging", request.huisnummertoevoeging.trim());
   }
 
-  const response = await fetch(`/api/property/search?${params.toString()}`);
-  const body = (await response.json()) as CombinedSearchResponse | ApiErrorResponse;
+  const response = await fetch(`/api/property/search?${params.toString()}`, {
+    headers: {
+      Accept: "application/json"
+    }
+  });
+  const body = (await parseApiResponse(response)) as
+    | CombinedSearchResponse
+    | ApiErrorResponse
+    | null;
 
   if (!response.ok) {
     const apiError = body as ApiErrorResponse;
-    throw new Error(apiError.error?.message ?? "The property search failed.");
+    throw new Error(
+      apiError?.error?.message ??
+        `The property search failed with HTTP ${response.status}.`
+    );
+  }
+
+  if (!body || typeof body !== "object") {
+    throw new Error("The property search returned an empty response.");
   }
 
   return body as CombinedSearchResponse;
@@ -388,7 +421,37 @@ function getExcelValue(row: Record<string, unknown>, aliases: string[]): string 
   );
 
   const value = matchingKey ? row[matchingKey] : "";
-  return value === null || value === undefined ? "" : String(value).trim();
+  if (value === null || value === undefined || value instanceof Date) {
+    return "";
+  }
+
+  return String(value).replace(/\u00a0/g, " ").trim();
+}
+
+function normalizeExcelPostcode(value: string): string {
+  return value.replace(/\s+/g, "").toUpperCase();
+}
+
+function normalizeExcelHouseNumber(value: string): string {
+  const trimmed = value.trim();
+  const wholeNumberMatch = trimmed.match(/^(\d+)(?:\.0+)?$/);
+  return wholeNumberMatch ? wholeNumberMatch[1] : trimmed;
+}
+
+function validateBatchRow(row: BatchInputRow): string | null {
+  if (!row.postcode || !row.huisnummer) {
+    return "Postcode and huisnummer are required for this row.";
+  }
+
+  if (!/^\d{4}[A-Z]{2}$/.test(row.postcode)) {
+    return "Postcode must use the Dutch format 1234AB.";
+  }
+
+  if (!/^\d+$/.test(row.huisnummer) || Number(row.huisnummer) <= 0) {
+    return "Huisnummer must be a positive whole number.";
+  }
+
+  return null;
 }
 
 function parseExcelRows(rows: Record<string, unknown>[]): BatchInputRow[] {
@@ -396,19 +459,23 @@ function parseExcelRows(rows: Record<string, unknown>[]): BatchInputRow[] {
     .map((row, index) => ({
       id: `${index + 2}-${getExcelValue(row, ["postcode"])}`,
       rowNumber: index + 2,
-      postcode: getExcelValue(row, ["postcode", "post code", "pc"]),
-      huisnummer: getExcelValue(row, [
-        "huisnummer",
-        "huis nummer",
-        "huisnr",
-        "nummer"
-      ]),
-      huisletter: getExcelValue(row, ["huisletter", "letter"]),
+      postcode: normalizeExcelPostcode(
+        getExcelValue(row, ["postcode", "post code", "pc"])
+      ),
+      huisnummer: normalizeExcelHouseNumber(
+        getExcelValue(row, [
+          "huisnummer",
+          "huis nummer",
+          "huisnr",
+          "nummer"
+        ])
+      ),
+      huisletter: getExcelValue(row, ["huisletter", "letter"]).toUpperCase(),
       huisnummertoevoeging: getExcelValue(row, [
         "huisnummertoevoeging",
         "huisnummer toevoeging",
         "toevoeging"
-      ])
+      ]).toUpperCase()
     }))
     .filter((row) => row.postcode || row.huisnummer);
 }
@@ -906,6 +973,20 @@ function App() {
     setBatchProgress(0);
 
     for (const row of batchRows) {
+      const validationError = validateBatchRow(row);
+      if (validationError) {
+        setBatchResults((current) => [
+          ...current,
+          {
+            row,
+            status: "error",
+            error: validationError
+          }
+        ]);
+        setBatchProgress((current) => current + 1);
+        continue;
+      }
+
       try {
         const result = await searchProperty({
           postcode: row.postcode,
