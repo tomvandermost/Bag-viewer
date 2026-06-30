@@ -1,56 +1,52 @@
-# BAG + Cadastral Parcel Lookup
+# Bag-viewer
 
-This local web application searches an address in the official Kadaster BAG API by Dutch postcode and house number. It then uses the BAG coordinate to query the PDOK Kadastrale Kaart OGC API Features service for the corresponding public cadastral parcel.
+Bag-viewer is a local React + Express application for looking up public Dutch address and cadastral parcel information with official APIs only.
 
-The browser only talks to the local Express backend. The BAG API key stays in `server/.env` and is never exposed to frontend code.
+The app supports two search routes:
 
-## What The App Does
+1. **Without BAG API key - PDOK Locatieserver**
+   `PDOK Locatieserver -> RD coordinate -> PDOK Kadastrale Kaart`
+2. **With BAG API key - official BAG API**
+   `BAG API -> full BAG information + RD coordinate -> PDOK Kadastrale Kaart`
 
-1. You enter a postcode, huisnummer, and optional huisletter or huisnummertoevoeging.
-2. The backend queries the BAG API Individuele Bevragingen v2 endpoint `/adressenuitgebreid`.
-3. The backend normalizes BAG address, building, geometry, object ID, status, usage, surface, and bouwjaar fields.
-4. The backend extracts the best BAG coordinate in EPSG:28992.
-5. The backend queries PDOK Kadastrale Kaart collection `perceel`.
-6. The frontend displays the input address, BAG information, and cadastral parcel information separately.
+The default route is PDOK Locatieserver, so the app works without a BAG API key.
 
-## BAG And PDOK Are Different
+## What Each Dataset Provides
 
-BAG data describes addresses and addressable objects: street/address fields, woonplaats, verblijfsobject or other object IDs, pand IDs, bouwjaar, oppervlakte, gebruiksdoelen, object type, status, and geometry.
+BAG data describes addresses and addressable objects: street and address fields, woonplaats, BAG object IDs, pand IDs, bouwjaar, oppervlakte, gebruiksdoelen, status, and geometry.
 
-PDOK Kadastrale Kaart data describes public parcel map information: cadastral parcel identifier, cadastral municipality, section, parcel number, parcel size where available, and parcel boundary geometry.
+PDOK Locatieserver is used to find an address match and RD coordinate without an API key.
 
-PDOK Kadastrale Kaart does not provide ownership data, owner names, mortgages, rights, or official cadastral extracts. The public cadastral map is indicative and should not replace official cadastral research.
+PDOK Kadastrale Kaart provides public parcel map information: parcel identifier, cadastral municipality, section, parcel number, parcel size where available, and parcel boundary geometry.
 
-## Install Dependencies
+PDOK Kadastrale Kaart does **not** provide ownership data, owner names, mortgages, rights, or official cadastral extracts. The public cadastral map is indicative and should not replace official cadastral research.
+
+## Install
 
 ```bash
 npm run install:all
 ```
 
-## Add The BAG API Key
+## Optional BAG API Key
 
-Create a local env file:
+The PDOK route works without a key. The BAG route requires `BAG_API_KEY` in `server/.env`.
+
+Create the env file:
 
 ```bash
 cp server/.env.example server/.env
 ```
 
-Then set your Kadaster BAG API key:
+For PDOK-only use, you can leave `BAG_API_KEY` as the placeholder. For the BAG route, add your Kadaster key:
 
 ```env
 BAG_API_KEY=your_bag_api_key_here
 PORT=3001
 ```
 
-The backend forwards the key to Kadaster with:
+The frontend never receives the key. The backend sends it to Kadaster as `X-Api-Key`.
 
-```text
-X-Api-Key: <your key>
-```
-
-## Run The App
-
-Start both the Express backend and Vite frontend:
+## Run
 
 ```bash
 npm run dev
@@ -68,6 +64,28 @@ The backend runs on:
 http://localhost:3001
 ```
 
+## Batch Lookup With Excel
+
+The frontend can process an `.xlsx` file and generate a list of parcel matches for multiple addresses.
+
+Use the first sheet with a header row. Supported column names include:
+
+```text
+postcode
+huisnummer
+huisletter
+huisnummertoevoeging
+```
+
+The optional columns may be left empty. The batch lookup uses the route selected in the form:
+
+- `pdok`: works without a BAG API key.
+- `bag`: requires `BAG_API_KEY` in `server/.env`.
+
+For each row, the app returns the best parcel match, the selection method, linked parcel references from the source, other linked references, other linked candidate parcels, other spatial candidates, and any row-level error.
+
+CSV downloads are intentionally compact parcel overviews focused on cadastral municipality, section, parcel number or parcel references, parcel size, match method, and row status. JSON downloads contain the full technical response for auditing or debugging.
+
 ## Build And Start
 
 ```bash
@@ -75,11 +93,11 @@ npm run build
 npm run start
 ```
 
-`npm run start` starts the built backend. For production hosting, serve the files from `client/dist` with a static file server or hosting platform.
+`npm run start` starts the built backend. For production hosting, serve `client/dist` with a static file server or hosting platform.
 
 ## Local API
 
-The combined endpoint is:
+Endpoint:
 
 ```text
 GET /api/property/search
@@ -92,22 +110,43 @@ postcode
 huisnummer
 huisletter optional
 huisnummertoevoeging optional
+route optional: pdok or bag
 ```
 
-The backend uses BAG:
+If `route` is missing, the backend uses:
+
+```text
+pdok
+```
+
+### Route A: PDOK Locatieserver
+
+Uses:
+
+```text
+https://api.pdok.nl/bzk/locatieserver/search/v3_1/free
+```
+
+The backend searches the address, prefers address-level results, extracts `centroide_rd`, and uses that EPSG:28992 coordinate for the parcel lookup.
+
+### Route B: BAG API
+
+Uses:
 
 ```text
 https://api.bag.kadaster.nl/lvbag/individuelebevragingen/v2/adressenuitgebreid
 ```
 
-with `exacteMatch=true`, `page=1`, `pageSize=20`, `Accept: application/hal+json`, `Accept-Crs: epsg:28992`, and `X-Api-Key`.
+with `postcode`, `huisnummer`, optional `huisletter`, optional `huisnummertoevoeging`, `exacteMatch=true`, `page=1`, `pageSize=20`, `Accept: application/hal+json`, `Accept-Crs: epsg:28992`, and `X-Api-Key`.
 
-The backend uses PDOK:
+The BAG API Individuele Bevragingen is intended for individual lookups. Do not use it for large-scale scraping or bulk collection.
+
+### Parcel Lookup
+
+Both routes use:
 
 ```text
 https://api.pdok.nl/kadaster/brk-kadastrale-kaart/ogc/v1/collections/perceel/items
 ```
 
-It first tries a CQL2 spatial filter and falls back to a small EPSG:28992 bbox around the BAG coordinate.
-
-The BAG API Individuele Bevragingen is intended for individual lookups. Do not use this app for large-scale scraping or bulk collection.
+The backend queries a small EPSG:28992 bbox around the address coordinate and retries without CRS parameters if necessary.

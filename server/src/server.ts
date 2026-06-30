@@ -7,17 +7,21 @@ dotenv.config();
 const PORT = Number(process.env.PORT ?? 3001);
 const BAG_BASE_URL =
   "https://api.bag.kadaster.nl/lvbag/individuelebevragingen/v2";
-const PDOK_BASE_URL =
+const PDOK_LOCATIESERVER_BASE_URL =
+  "https://api.pdok.nl/bzk/locatieserver/search/v3_1";
+const PDOK_CADASTRE_BASE_URL =
   "https://api.pdok.nl/kadaster/brk-kadastrale-kaart/ogc/v1";
 const EPSG_28992_URI = "http://www.opengis.net/def/crs/EPSG/0/28992";
 
 type RawObject = Record<string, unknown>;
+type SearchRoute = "pdok" | "bag";
 
-type BagSearchInput = {
+type SearchInput = {
   postcode: string;
   huisnummer: string;
   huisletter: string | null;
   huisnummertoevoeging: string | null;
+  route: SearchRoute;
 };
 
 type BagSearchResult = {
@@ -42,7 +46,25 @@ type BagSearchResult = {
   raw: RawObject;
 };
 
-type BagCoordinate = {
+type PdokLocationResult = {
+  weergavenaam: string | null;
+  straatnaam: string | null;
+  huisnummer: number | string | null;
+  huisletter: string | null;
+  huisnummertoevoeging: string | null;
+  postcode: string | null;
+  woonplaatsnaam: string | null;
+  gemeentenaam: string | null;
+  provincienaam: string | null;
+  type: string | null;
+  score: number | string | null;
+  centroide_rd: string | null;
+  gekoppeldePercelen: string[];
+  gekoppeldeAppartementen: string[];
+  raw: RawObject;
+};
+
+type Coordinate = {
   x: number;
   y: number;
   crs: "EPSG:28992";
@@ -62,19 +84,36 @@ type ParcelResult = {
   raw: RawObject;
 };
 
+type SourceResult = {
+  type: "PDOK Locatieserver" | "BAG API";
+  count: number;
+  bestMatch: PdokLocationResult | BagSearchResult | null;
+  results: Array<PdokLocationResult | BagSearchResult>;
+  raw: unknown;
+};
+
 type CombinedSearchResponse = {
-  input: BagSearchInput;
+  input: SearchInput;
+  routeUsed: SearchRoute;
+  source: SourceResult;
   bag: {
     count: number;
     results: BagSearchResult[];
     raw: unknown;
   };
-  coordinate: BagCoordinate;
+  coordinate: Coordinate;
   cadastre: {
     count: number;
     bestMatch: ParcelResult;
     candidates: ParcelResult[];
     raw: unknown;
+    selection: {
+      method: string;
+      matchedReference: string | null;
+    };
+    linkedReferences: string[];
+    linkedCandidateMatches: ParcelResult[];
+    otherLinkedCandidateMatches: ParcelResult[];
   };
   warnings: string[];
 };
@@ -84,9 +123,11 @@ type ApiErrorCode =
   | "MISSING_PARAMETERS"
   | "INVALID_POSTCODE"
   | "INVALID_HUISNUMMER"
+  | "INVALID_ROUTE"
   | "BAG_AUTHORIZATION_ERROR"
   | "BAG_RATE_LIMIT"
   | "NO_BAG_RESULT"
+  | "NO_PDOK_LOCATION_RESULT"
   | "NO_USABLE_COORDINATE"
   | "PDOK_REQUEST_FAILED"
   | "NO_CADASTRAL_PARCEL"
@@ -164,20 +205,21 @@ function optionalTrim(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
-function parseInput(request: Request): BagSearchInput {
+function parseInput(request: Request): SearchInput {
   const postcode = optionalTrim(getSingleQueryValue(request.query.postcode));
   const huisnummer = optionalTrim(getSingleQueryValue(request.query.huisnummer));
   const huisletter = optionalTrim(getSingleQueryValue(request.query.huisletter));
   const huisnummertoevoeging = optionalTrim(
     getSingleQueryValue(request.query.huisnummertoevoeging)
   );
+  const routeQuery = optionalTrim(getSingleQueryValue(request.query.route)) ?? "pdok";
 
-  if (!postcode || !huisnummer) {
-    throw new HttpError(
-      400,
-      "MISSING_PARAMETERS",
-      "Postcode and huisnummer are required."
-    );
+  if (!postcode) {
+    throw new HttpError(400, "MISSING_PARAMETERS", "Postcode is required.");
+  }
+
+  if (!huisnummer) {
+    throw new HttpError(400, "MISSING_PARAMETERS", "Huisnummer is required.");
   }
 
   const cleanedPostcode = cleanPostcode(postcode);
@@ -197,11 +239,20 @@ function parseInput(request: Request): BagSearchInput {
     );
   }
 
+  if (routeQuery !== "pdok" && routeQuery !== "bag") {
+    throw new HttpError(
+      400,
+      "INVALID_ROUTE",
+      "Route must be either pdok or bag."
+    );
+  }
+
   return {
     postcode: cleanedPostcode,
     huisnummer,
     huisletter: huisletter?.toUpperCase() ?? null,
-    huisnummertoevoeging: huisnummertoevoeging?.toUpperCase() ?? null
+    huisnummertoevoeging: huisnummertoevoeging?.toUpperCase() ?? null,
+    route: routeQuery
   };
 }
 
@@ -211,7 +262,7 @@ function getApiKey(): string {
     throw new HttpError(
       500,
       "MISSING_API_KEY",
-      "BAG API key is missing. Add BAG_API_KEY to server/.env."
+      "BAG_API_KEY is missing. Use the PDOK Locatieserver route or add BAG_API_KEY to server/.env."
     );
   }
 
@@ -450,6 +501,28 @@ function normalizeBagItem(item: RawObject): BagSearchResult {
   };
 }
 
+function normalizePdokLocationResult(item: RawObject): PdokLocationResult {
+  return {
+    weergavenaam: getString(firstValue(item, ["weergavenaam", "suggest"])),
+    straatnaam: getString(firstValue(item, ["straatnaam", "straatnaam_verkort"])),
+    huisnummer: getNumberOrString(firstValue(item, ["huisnummer"])),
+    huisletter: getString(firstValue(item, ["huisletter"])),
+    huisnummertoevoeging: getString(firstValue(item, ["huisnummertoevoeging"])),
+    postcode: getString(firstValue(item, ["postcode"])),
+    woonplaatsnaam: getString(firstValue(item, ["woonplaatsnaam"])),
+    gemeentenaam: getString(firstValue(item, ["gemeentenaam"])),
+    provincienaam: getString(firstValue(item, ["provincienaam"])),
+    type: getString(firstValue(item, ["type"])),
+    score: getNumberOrString(firstValue(item, ["score", "sortering", "typesortering"])),
+    centroide_rd: getString(firstValue(item, ["centroide_rd", "geometrie_rd"])),
+    gekoppeldePercelen: compactStrings(getArray(firstValue(item, ["gekoppeld_perceel"]))),
+    gekoppeldeAppartementen: compactStrings(
+      getArray(firstValue(item, ["gekoppeld_appartement"]))
+    ),
+    raw: item
+  };
+}
+
 function isNumberPair(value: unknown): value is [number, number] {
   return (
     Array.isArray(value) &&
@@ -486,10 +559,22 @@ function flattenNumberPairs(value: unknown): Array<[number, number]> {
   return value.flatMap((item) => flattenNumberPairs(item));
 }
 
-function coordinateFromGeometry(
-  value: unknown,
-  source: string
-): BagCoordinate | null {
+function parsePointText(value: string | null): [number, number] | null {
+  if (!value) {
+    return null;
+  }
+
+  const match = value.match(/POINT\s*\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)/i);
+  if (!match) {
+    return null;
+  }
+
+  const x = Number(match[1]);
+  const y = Number(match[2]);
+  return Number.isFinite(x) && Number.isFinite(y) ? [x, y] : null;
+}
+
+function coordinateFromGeometry(value: unknown, source: string): Coordinate | null {
   const object = getObject(value);
 
   if (object) {
@@ -544,10 +629,22 @@ function coordinateFromGeometry(
     };
   }
 
+  if (typeof value === "string") {
+    const point = parsePointText(value);
+    if (point) {
+      return {
+        x: point[0],
+        y: point[1],
+        crs: "EPSG:28992",
+        source
+      };
+    }
+  }
+
   return null;
 }
 
-function extractCoordinateFromBagResult(result: BagSearchResult): BagCoordinate | null {
+function extractCoordinateFromBagResult(result: BagSearchResult): Coordinate | null {
   const rawObject = result.raw;
   const object = getObject(
     firstValue(rawObject, [
@@ -560,9 +657,9 @@ function extractCoordinateFromBagResult(result: BagSearchResult): BagCoordinate 
 
   const candidates: Array<[unknown, string]> = [
     [result.geometrie, "BAG geometry"],
-    [firstValue(object ?? {}, ["geometrie", "punt", "vlak"]), "BAG addressable object geometry"],
-    [firstValue(rawObject, ["geometrie", "adresseerbaarObjectGeometrie"]), "BAG raw geometry"],
-    [rawObject, "BAG result geometry"]
+    [firstValue(object ?? {}, ["geometrie", "punt", "vlak"]), "BAG geometry"],
+    [firstValue(rawObject, ["geometrie", "adresseerbaarObjectGeometrie"]), "BAG geometry"],
+    [rawObject, "BAG geometry"]
   ];
 
   for (const [candidate, source] of candidates) {
@@ -575,7 +672,132 @@ function extractCoordinateFromBagResult(result: BagSearchResult): BagCoordinate 
   return null;
 }
 
-async function searchBag(input: BagSearchInput) {
+function extractCoordinateFromPdokLocationResult(
+  result: PdokLocationResult
+): Coordinate | null {
+  const point = parsePointText(result.centroide_rd);
+  if (!point) {
+    return null;
+  }
+
+  return {
+    x: point[0],
+    y: point[1],
+    crs: "EPSG:28992",
+    source: "PDOK Locatieserver centroide_rd"
+  };
+}
+
+function normalizeParcelReference(value: unknown): string | null {
+  const text = getString(value)?.trim().toUpperCase();
+  if (!text) {
+    return null;
+  }
+
+  return text.replace(/\s+/g, "");
+}
+
+function buildParcelReference(
+  gemeenteCode: unknown,
+  sectie: unknown,
+  perceelnummer: unknown
+): string | null {
+  const code = normalizeParcelReference(gemeenteCode);
+  const section = normalizeParcelReference(sectie);
+  const number = normalizeParcelReference(perceelnummer);
+
+  if (!code || !section || !number) {
+    return null;
+  }
+
+  return `${code}-${section}-${number}`;
+}
+
+function parcelReferences(parcel: ParcelResult): string[] {
+  const propertyCode =
+    firstValue(parcel.properties, [
+      "akr_kadastrale_gemeente_code_waarde",
+      "kadastraleGemeenteCode",
+      "kadastrale_gemeente_code_waarde"
+    ]) ?? parcel.kadastraleAanduiding;
+
+  return [
+    buildParcelReference(propertyCode, parcel.sectie, parcel.perceelnummer),
+    normalizeParcelReference(parcel.kadastraleAanduiding)
+  ].filter((value): value is string => Boolean(value));
+}
+
+function selectBestParcel(
+  candidates: ParcelResult[],
+  preferredParcelReferences: string[]
+): {
+  bestMatch: ParcelResult;
+  selection: { method: string; matchedReference: string | null };
+  linkedReferences: string[];
+  linkedCandidateMatches: ParcelResult[];
+  otherLinkedCandidateMatches: ParcelResult[];
+  warnings: string[];
+} {
+  const normalizedPreferred = Array.from(
+    new Set(
+      preferredParcelReferences
+        .map(normalizeParcelReference)
+        .filter((value): value is string => Boolean(value))
+    )
+  );
+
+  const linkedCandidateMatches = candidates.filter((candidate) => {
+    const references = parcelReferences(candidate);
+    return normalizedPreferred.some((preferred) => references.includes(preferred));
+  });
+
+  for (const preferred of normalizedPreferred) {
+    const matchingCandidate = candidates.find((candidate) =>
+      parcelReferences(candidate).includes(preferred)
+    );
+
+    if (matchingCandidate) {
+      return {
+        bestMatch: matchingCandidate,
+        selection: {
+          method: "linked parcel reference",
+          matchedReference: preferred
+        },
+        linkedReferences: normalizedPreferred,
+        linkedCandidateMatches,
+        otherLinkedCandidateMatches: linkedCandidateMatches.filter(
+          (candidate) => candidate.identificatie !== matchingCandidate.identificatie
+        ),
+        warnings: []
+      };
+    }
+  }
+
+  const bestMatch = candidates[0];
+
+  return {
+    bestMatch,
+    selection: {
+      method: "first spatial candidate",
+      matchedReference: null
+    },
+    linkedReferences: normalizedPreferred,
+    linkedCandidateMatches,
+    otherLinkedCandidateMatches: linkedCandidateMatches.filter(
+      (candidate) => candidate.identificatie !== bestMatch.identificatie
+    ),
+    warnings:
+      normalizedPreferred.length > 0
+        ? [
+            `Linked parcel reference ${normalizedPreferred.join(
+              ", "
+            )} was not present in the Kadastrale Kaart candidates; first spatial candidate was used.`
+          ]
+        : []
+  };
+}
+
+async function searchBag(input: SearchInput) {
   const apiKey = getApiKey();
   const searchParams = new URLSearchParams({
     postcode: input.postcode,
@@ -647,6 +869,103 @@ async function searchBag(input: BagSearchInput) {
   };
 }
 
+function buildPdokLocationQuery(input: SearchInput): string {
+  const house = [
+    input.huisnummer,
+    input.huisletter,
+    input.huisnummertoevoeging
+  ]
+    .filter(Boolean)
+    .join("");
+
+  return `${input.postcode} ${house}`;
+}
+
+function scorePdokLocation(result: PdokLocationResult, input: SearchInput): number {
+  let score = 0;
+
+  if (result.type === "adres") {
+    score += 100;
+  }
+
+  if (result.postcode?.toUpperCase() === input.postcode) {
+    score += 40;
+  }
+
+  if (String(result.huisnummer) === input.huisnummer) {
+    score += 30;
+  }
+
+  if ((result.huisletter ?? null) === input.huisletter) {
+    score += 10;
+  } else if (!input.huisletter && !result.huisletter) {
+    score += 10;
+  }
+
+  if ((result.huisnummertoevoeging ?? null) === input.huisnummertoevoeging) {
+    score += 10;
+  } else if (!input.huisnummertoevoeging && !result.huisnummertoevoeging) {
+    score += 10;
+  }
+
+  const numericScore = Number(result.score);
+  if (Number.isFinite(numericScore)) {
+    score += numericScore;
+  }
+
+  return score;
+}
+
+async function searchPdokLocation(input: SearchInput) {
+  const url = new URL(`${PDOK_LOCATIESERVER_BASE_URL}/free`);
+  url.searchParams.set("q", buildPdokLocationQuery(input));
+  url.searchParams.set("rows", "10");
+  url.searchParams.set("fl", "*,score");
+
+  const response = await fetch(url, {
+    headers: {
+      Accept: "application/json"
+    }
+  });
+  const body = await readResponseBody(response);
+
+  if (!response.ok) {
+    throw new HttpError(
+      502,
+      "PDOK_REQUEST_FAILED",
+      "PDOK Locatieserver request failed.",
+      body
+    );
+  }
+
+  const root = getObject(body);
+  const docs = getArray(nestedFirst(root ?? {}, [["response", "docs"]]))
+    .map((item) => getObject(item))
+    .filter((item): item is RawObject => Boolean(item))
+    .map(normalizePdokLocationResult)
+    .sort((a, b) => scorePdokLocation(b, input) - scorePdokLocation(a, input));
+
+  const addressMatches = docs.filter((result) => result.type === "adres");
+  const results = addressMatches.length > 0 ? addressMatches : docs;
+  const bestMatch = results[0];
+
+  if (!bestMatch) {
+    throw new HttpError(
+      404,
+      "NO_PDOK_LOCATION_RESULT",
+      "No PDOK Locatieserver result was found for this address.",
+      body
+    );
+  }
+
+  return {
+    count: results.length,
+    bestMatch,
+    results,
+    raw: body
+  };
+}
+
 function normalizeParcel(feature: unknown): ParcelResult | null {
   const featureObject = getObject(feature);
   if (!featureObject) {
@@ -668,15 +987,25 @@ function normalizeParcel(feature: unknown): ParcelResult | null {
   const perceelnummer = getNumberOrString(
     firstValue(properties, ["perceelnummer", "perceelNummer"])
   );
+  const akrGemeenteCode = firstValue(properties, [
+    "akr_kadastrale_gemeente_code_waarde",
+    "kadastraleGemeenteCode",
+    "kadastrale_gemeente_code_waarde"
+  ]);
+  const composedAanduiding = buildParcelReference(
+    akrGemeenteCode,
+    sectie,
+    perceelnummer
+  );
   const kadastraleAanduiding =
+    composedAanduiding ||
     getString(
       firstValue(properties, [
         "kadastraleAanduiding",
         "kadastrale_aanduiding",
         "akr_kadastrale_gemeente_code_waarde"
       ])
-    ) ??
-    [kadastraleGemeente, sectie, perceelnummer].filter(Boolean).join(" ") ??
+    ) ||
     null;
 
   return {
@@ -714,70 +1043,45 @@ async function fetchPdok(url: URL): Promise<{ body: unknown; response: globalThi
   return { body, response };
 }
 
-async function searchPdokCadastre(coordinate: BagCoordinate) {
+async function searchPdokCadastre(
+  coordinate: Coordinate,
+  preferredParcelReferences: string[] = []
+) {
   const warnings: string[] = [];
-  const cqlUrl = new URL(`${PDOK_BASE_URL}/collections/perceel/items`);
-  cqlUrl.searchParams.set("filter-lang", "cql2-text");
-  cqlUrl.searchParams.set(
-    "filter",
-    `INTERSECTS(geometry,POINT(${coordinate.x} ${coordinate.y}))`
-  );
-  cqlUrl.searchParams.set("crs", EPSG_28992_URI);
-  cqlUrl.searchParams.set("limit", "10");
-  cqlUrl.searchParams.set("f", "json");
+  const minX = coordinate.x - 2;
+  const minY = coordinate.y - 2;
+  const maxX = coordinate.x + 2;
+  const maxY = coordinate.y + 2;
 
-  let body: unknown;
-  let features: RawObject[] = [];
+  const bboxUrl = new URL(`${PDOK_CADASTRE_BASE_URL}/collections/perceel/items`);
+  bboxUrl.searchParams.set("bbox", `${minX},${minY},${maxX},${maxY}`);
+  bboxUrl.searchParams.set("bbox-crs", EPSG_28992_URI);
+  bboxUrl.searchParams.set("crs", EPSG_28992_URI);
+  bboxUrl.searchParams.set("limit", "10");
+  bboxUrl.searchParams.set("f", "json");
 
-  try {
-    const cql = await fetchPdok(cqlUrl);
-    if (cql.response.ok) {
-      body = cql.body;
-      features = extractPdokFeatures(cql.body);
-    } else {
-      warnings.push("PDOK CQL2 spatial filter failed; bbox fallback was used.");
-    }
-  } catch {
-    warnings.push("PDOK CQL2 spatial filter failed; bbox fallback was used.");
+  let result = await fetchPdok(bboxUrl);
+
+  if (!result.response.ok) {
+    warnings.push("PDOK Kadastrale Kaart rejected CRS parameters; bbox retry without CRS was used.");
+
+    const fallbackUrl = new URL(`${PDOK_CADASTRE_BASE_URL}/collections/perceel/items`);
+    fallbackUrl.searchParams.set("bbox", `${minX},${minY},${maxX},${maxY}`);
+    fallbackUrl.searchParams.set("limit", "10");
+    fallbackUrl.searchParams.set("f", "json");
+    result = await fetchPdok(fallbackUrl);
   }
 
-  if (features.length === 0) {
-    const minX = coordinate.x - 2;
-    const minY = coordinate.y - 2;
-    const maxX = coordinate.x + 2;
-    const maxY = coordinate.y + 2;
-
-    const bboxUrl = new URL(`${PDOK_BASE_URL}/collections/perceel/items`);
-    bboxUrl.searchParams.set("bbox", `${minX},${minY},${maxX},${maxY}`);
-    bboxUrl.searchParams.set("bbox-crs", EPSG_28992_URI);
-    bboxUrl.searchParams.set("crs", EPSG_28992_URI);
-    bboxUrl.searchParams.set("limit", "10");
-    bboxUrl.searchParams.set("f", "json");
-
-    let bbox = await fetchPdok(bboxUrl);
-
-    if (!bbox.response.ok) {
-      const simpleBboxUrl = new URL(`${PDOK_BASE_URL}/collections/perceel/items`);
-      simpleBboxUrl.searchParams.set("bbox", `${minX},${minY},${maxX},${maxY}`);
-      simpleBboxUrl.searchParams.set("limit", "10");
-      simpleBboxUrl.searchParams.set("f", "json");
-      bbox = await fetchPdok(simpleBboxUrl);
-    }
-
-    if (!bbox.response.ok) {
-      throw new HttpError(
-        502,
-        "PDOK_REQUEST_FAILED",
-        "PDOK Kadastrale Kaart request failed.",
-        bbox.body
-      );
-    }
-
-    body = bbox.body;
-    features = extractPdokFeatures(bbox.body);
+  if (!result.response.ok) {
+    throw new HttpError(
+      502,
+      "PDOK_REQUEST_FAILED",
+      "PDOK Kadastrale Kaart request failed.",
+      result.body
+    );
   }
 
-  const candidates = features
+  const candidates = extractPdokFeatures(result.body)
     .map((feature) => normalizeParcel(feature))
     .filter((feature): feature is ParcelResult => Boolean(feature));
 
@@ -785,44 +1089,112 @@ async function searchPdokCadastre(coordinate: BagCoordinate) {
     throw new HttpError(
       404,
       "NO_CADASTRAL_PARCEL",
-      "No cadastral parcel was found near the BAG coordinate.",
-      body
+      "No cadastral parcel was found near the coordinate.",
+      result.body
     );
   }
 
+  const selection = selectBestParcel(candidates, preferredParcelReferences);
+
   return {
     count: candidates.length,
-    bestMatch: candidates[0],
+    bestMatch: selection.bestMatch,
     candidates,
-    raw: body,
-    warnings
+    raw: result.body,
+    selection: selection.selection,
+    linkedReferences: selection.linkedReferences,
+    linkedCandidateMatches: selection.linkedCandidateMatches,
+    otherLinkedCandidateMatches: selection.otherLinkedCandidateMatches,
+    warnings: [...warnings, ...selection.warnings]
   };
 }
 
-async function runCombinedSearch(input: BagSearchInput): Promise<CombinedSearchResponse> {
-  const bag = await searchBag(input);
-  const coordinate = extractCoordinateFromBagResult(bag.results[0]);
+async function runCombinedSearch(input: SearchInput): Promise<CombinedSearchResponse> {
+  const emptyBag = {
+    count: 0,
+    results: [] as BagSearchResult[],
+    raw: null
+  };
+
+  if (input.route === "bag") {
+    const bag = await searchBag(input);
+    const coordinate = extractCoordinateFromBagResult(bag.results[0]);
+
+    if (!coordinate) {
+      throw new HttpError(
+        422,
+        "NO_USABLE_COORDINATE",
+        "A BAG result was found, but no usable EPSG:28992 coordinate could be extracted.",
+        bag.results[0]?.raw
+      );
+    }
+
+    const cadastre = await searchPdokCadastre(coordinate);
+
+    return {
+      input,
+      routeUsed: "bag",
+      source: {
+        type: "BAG API",
+        count: bag.count,
+        bestMatch: bag.results[0],
+        results: bag.results,
+        raw: bag.raw
+      },
+      bag,
+      coordinate,
+      cadastre: {
+        count: cadastre.count,
+        bestMatch: cadastre.bestMatch,
+        candidates: cadastre.candidates,
+        raw: cadastre.raw,
+        selection: cadastre.selection,
+        linkedReferences: cadastre.linkedReferences,
+        linkedCandidateMatches: cadastre.linkedCandidateMatches,
+        otherLinkedCandidateMatches: cadastre.otherLinkedCandidateMatches
+      },
+      warnings: cadastre.warnings
+    };
+  }
+
+  const pdokLocation = await searchPdokLocation(input);
+  const coordinate = extractCoordinateFromPdokLocationResult(pdokLocation.bestMatch);
 
   if (!coordinate) {
     throw new HttpError(
       422,
       "NO_USABLE_COORDINATE",
-      "A BAG result was found, but no usable EPSG:28992 coordinate could be extracted.",
-      bag.results[0]?.raw
+      "A PDOK Locatieserver result was found, but no usable EPSG:28992 coordinate could be extracted.",
+      pdokLocation.bestMatch.raw
     );
   }
 
-  const cadastre = await searchPdokCadastre(coordinate);
+  const cadastre = await searchPdokCadastre(
+    coordinate,
+    pdokLocation.bestMatch.gekoppeldePercelen
+  );
 
   return {
     input,
-    bag,
+    routeUsed: "pdok",
+    source: {
+      type: "PDOK Locatieserver",
+      count: pdokLocation.count,
+      bestMatch: pdokLocation.bestMatch,
+      results: pdokLocation.results,
+      raw: pdokLocation.raw
+    },
+    bag: emptyBag,
     coordinate,
     cadastre: {
       count: cadastre.count,
       bestMatch: cadastre.bestMatch,
       candidates: cadastre.candidates,
-      raw: cadastre.raw
+      raw: cadastre.raw,
+      selection: cadastre.selection,
+      linkedReferences: cadastre.linkedReferences,
+      linkedCandidateMatches: cadastre.linkedCandidateMatches,
+      otherLinkedCandidateMatches: cadastre.otherLinkedCandidateMatches
     },
     warnings: cadastre.warnings
   };
@@ -839,7 +1211,7 @@ app.get("/api/property/search", async (request, response) => {
 
 app.get("/api/bag/search", async (request, response) => {
   try {
-    const input = parseInput(request);
+    const input = { ...parseInput(request), route: "bag" as const };
     const bag = await searchBag(input);
     response.json({
       query: input,
