@@ -1224,6 +1224,10 @@ app.get("/api/bag/search", async (request, response) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`BAG + PDOK proxy server listening on http://localhost:${PORT}`);
-});
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`BAG + PDOK proxy server listening on http://localhost:${PORT}`);
+  });
+}
+
+export default app;

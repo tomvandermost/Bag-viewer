@@ -95,6 +95,19 @@ npm run start
 
 `npm run start` starts the built backend. For production hosting, serve `client/dist` with a static file server or hosting platform.
 
+## Deploy On Vercel
+
+This repository includes `vercel.json` for Vercel deployments.
+
+Vercel uses:
+
+- install command: `npm run install:all`
+- build command: `npm run build`
+- output directory: `client/dist`
+- serverless API route: `/api/property/search`
+
+If you want to use the BAG route on Vercel, add `BAG_API_KEY` as an environment variable in the Vercel project settings. The default PDOK route works without a BAG key.
+
 ## Local API
 
 Endpoint:
