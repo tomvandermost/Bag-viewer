@@ -19,7 +19,7 @@ type BagSearchResult = {
   adresseerbaarObjectIdentificatie: string | null;
   adresseerbaarObjectType: string | null;
   pandIdentificaties: string[];
-  oorspronkelijkBouwjaar: string | number | null;
+  oorspronkelijkBouwjaar: string | number | Array<string | number> | null;
   oppervlakte: string | number | null;
   gebruiksdoelen: string[];
   status: string | null;

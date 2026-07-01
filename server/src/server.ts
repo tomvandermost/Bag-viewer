@@ -1,8 +1,11 @@
 import cors from "cors";
 import dotenv from "dotenv";
 import express, { Request, Response } from "express";
+import { fileURLToPath } from "node:url";
 
-dotenv.config();
+dotenv.config({
+  path: fileURLToPath(new URL("../.env", import.meta.url))
+});
 
 const PORT = Number(process.env.PORT ?? 3001);
 const BAG_BASE_URL =
@@ -37,7 +40,7 @@ type BagSearchResult = {
   adresseerbaarObjectIdentificatie: string | null;
   adresseerbaarObjectType: string | null;
   pandIdentificaties: string[];
-  oorspronkelijkBouwjaar: string | number | null;
+  oorspronkelijkBouwjaar: string | number | Array<string | number> | null;
   oppervlakte: number | string | null;
   gebruiksdoelen: string[];
   status: string | null;
@@ -327,6 +330,23 @@ function getNumberOrString(value: unknown): number | string | null {
   return null;
 }
 
+function getNumberOrStringList(value: unknown): Array<number | string> {
+  return getArray(value).filter(
+    (item): item is number | string =>
+      typeof item === "number" || typeof item === "string"
+  );
+}
+
+function getNumberStringOrList(value: unknown): number | string | Array<number | string> | null {
+  const direct = getNumberOrString(value);
+  if (direct !== null) {
+    return direct;
+  }
+
+  const list = getNumberOrStringList(value);
+  return list.length > 0 ? list : null;
+}
+
 function getObject(value: unknown): RawObject | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as RawObject)
@@ -516,11 +536,16 @@ function normalizeBagItem(item: RawObject): BagSearchResult {
       ]) ?? firstValue(object ?? {}, ["identificatie"])
     ),
     adresseerbaarObjectType: getString(
-      firstValue(item, ["adresseerbaarObjectType", "adresseerbaarobjecttype", "type"]) ??
+      firstValue(item, [
+        "adresseerbaarObjectType",
+        "adresseerbaarobjecttype",
+        "typeAdresseerbaarObject",
+        "type"
+      ]) ??
         firstValue(object ?? {}, ["type"])
     ),
     pandIdentificaties: extractPandIdentificaties(item),
-    oorspronkelijkBouwjaar: getNumberOrString(
+    oorspronkelijkBouwjaar: getNumberStringOrList(
       firstValue(item, ["oorspronkelijkBouwjaar", "oorspronkelijkbouwjaar"]) ??
         firstValue(pand ?? {}, ["oorspronkelijkBouwjaar", "oorspronkelijkbouwjaar"])
     ),
@@ -529,10 +554,14 @@ function normalizeBagItem(item: RawObject): BagSearchResult {
         firstValue(object ?? {}, ["oppervlakte", "oppervlakteVerblijfsobject"])
     ),
     gebruiksdoelen: extractGebruiksdoelen(item),
-    status: getString(firstValue(item, ["status"]) ?? firstValue(object ?? {}, ["status"])),
+    status: getString(
+      firstValue(item, ["status", "adresseerbaarObjectStatus"]) ??
+        firstValue(object ?? {}, ["status"])
+    ),
     pandStatus: getString(
       firstValue(item, ["pandStatus", "pandstatus"]) ??
-        firstValue(pand ?? {}, ["status", "pandStatus", "pandstatus"])
+        (getArray(firstValue(item, ["pandStatussen", "pandstatussen"])).join(", ") ||
+          firstValue(pand ?? {}, ["status", "pandStatus", "pandstatus"]))
     ),
     geometrie: geometrie ?? null,
     raw: item
