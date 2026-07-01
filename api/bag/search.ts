@@ -1,3 +1,3 @@
-import app from "../../server/src/server";
+import { createBagSearchApp } from "../../server/src/server";
 
-export default app;
+export default createBagSearchApp();

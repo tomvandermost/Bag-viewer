@@ -150,13 +150,51 @@ class HttpError extends Error {
   }
 }
 
+const corsMiddleware = cors({
+  origin: "http://localhost:5173"
+});
+
 const app = express();
 
-app.use(
-  cors({
-    origin: "http://localhost:5173"
-  })
-);
+app.use(corsMiddleware);
+
+const handlePropertySearch = async (request: Request, response: Response) => {
+  try {
+    const input = parseInput(request);
+    response.json(await runCombinedSearch(input));
+  } catch (error) {
+    handleError(response, error);
+  }
+};
+
+const handleBagSearch = async (request: Request, response: Response) => {
+  try {
+    const input = { ...parseInput(request), route: "bag" as const };
+    const bag = await searchBag(input);
+    response.json({
+      query: input,
+      count: bag.count,
+      results: bag.results,
+      raw: bag.raw
+    });
+  } catch (error) {
+    handleError(response, error);
+  }
+};
+
+export function createPropertySearchApp() {
+  const propertyApp = express();
+  propertyApp.use(corsMiddleware);
+  propertyApp.get("*", handlePropertySearch);
+  return propertyApp;
+}
+
+export function createBagSearchApp() {
+  const bagApp = express();
+  bagApp.use(corsMiddleware);
+  bagApp.get("*", handleBagSearch);
+  return bagApp;
+}
 
 function sendError(
   response: Response,
@@ -1200,29 +1238,9 @@ async function runCombinedSearch(input: SearchInput): Promise<CombinedSearchResp
   };
 }
 
-app.get("/api/property/search", async (request, response) => {
-  try {
-    const input = parseInput(request);
-    response.json(await runCombinedSearch(input));
-  } catch (error) {
-    handleError(response, error);
-  }
-});
+app.get("/api/property/search", handlePropertySearch);
 
-app.get("/api/bag/search", async (request, response) => {
-  try {
-    const input = { ...parseInput(request), route: "bag" as const };
-    const bag = await searchBag(input);
-    response.json({
-      query: input,
-      count: bag.count,
-      results: bag.results,
-      raw: bag.raw
-    });
-  } catch (error) {
-    handleError(response, error);
-  }
-});
+app.get("/api/bag/search", handleBagSearch);
 
 if (!process.env.VERCEL) {
   app.listen(PORT, () => {
