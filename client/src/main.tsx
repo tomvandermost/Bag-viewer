@@ -1443,6 +1443,10 @@ function App() {
           )}
         </div>
       </section>
+
+      <footer className="app-signature">
+        Built by TVDM
+      </footer>
     </main>
   );
 }
