@@ -3,7 +3,7 @@ type ExpressHandler = (request: unknown, response: unknown) => unknown;
 let appPromise: Promise<ExpressHandler> | null = null;
 
 async function getApp() {
-  appPromise ??= import("../../server/src/server").then(
+  appPromise ??= import("../../server/src/server.js").then(
     ({ createPropertySearchApp }) => createPropertySearchApp() as ExpressHandler
   );
 
